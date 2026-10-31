@@ -117,6 +117,10 @@
     <string name="no_entries_available">Нет записей.</string>
     <string name="add_bookmark">Добавить закладку</string>
     <string name="remove_bookmark">Удалить закладку</string>
+    <string name="read_aloud">Читать вслух</string>
+    <string name="pause_read_aloud">Приостановить чтение вслух</string>
+    <string name="read_aloud_unavailable">Синтез речи недоступен на этом устройстве</string>
+    <string name="read_aloud_failed">Не удалось озвучить этот фрагмент</string>
     <string name="undo">Отменить</string>
     <string name="redo">Повторить</string>
     <string name="insert_timestamp">Вставить отметку времени</string>

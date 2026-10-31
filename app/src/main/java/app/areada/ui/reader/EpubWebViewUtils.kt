@@ -177,3 +177,173 @@ internal fun decodeJavascriptString(value: String?): String {
         JSONArray("[$value]").optString(0)
     }.getOrDefault("")
 }
+
+/**
+ * Page-side read-aloud helpers, installed once per loaded page. Text is indexed the same way
+ * [htmlReadAloudSegments] extracts it, so spoken segments can be found in the page by text.
+ * The highlight is drawn as an overlay, leaving the DOM (and the index) untouched.
+ */
+private const val ReadAloudScript = """
+window.__areadaTts = window.__areadaTts || (function() {
+  var index = null, current = null, overlay = null;
+  function build() {
+    var text = [], nodes = [], starts = [], nodeOf = [], offsetOf = [], space = true, node;
+    var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+    while ((node = walker.nextNode())) {
+      var parent = node.parentElement;
+      if (!parent || parent.closest('rt, rp, noscript, script, style')) continue;
+      var value = node.nodeValue, n = nodes.length;
+      nodes.push(node);
+      starts.push(text.length);
+      for (var k = 0; k < value.length; k++) {
+        var c = value.charCodeAt(k);
+        if (c === 173 || c === 8203) continue;
+        if (c === 32 || c === 160 || (c >= 9 && c <= 13)) {
+          if (space) continue;
+          space = true;
+          text.push(' ');
+        } else {
+          space = false;
+          text.push(value.charAt(k));
+        }
+        nodeOf.push(n);
+        offsetOf.push(k);
+      }
+    }
+    return { text: text.join(''), nodes: nodes, starts: starts, nodeOf: nodeOf, offsetOf: offsetOf };
+  }
+  function getIndex() {
+    if (index || !document.body) return index;
+    var built = build();
+    if (document.readyState === 'complete') index = built;
+    return built;
+  }
+  function find(idx, text, fraction) {
+    var hint = fraction * idx.text.length, best = -1, pos = idx.text.indexOf(text);
+    while (pos >= 0) {
+      if (best < 0 || Math.abs(pos - hint) < Math.abs(best - hint)) best = pos;
+      if (pos > hint) break;
+      pos = idx.text.indexOf(text, pos + 1);
+    }
+    return best;
+  }
+  function rangesFor(idx, start, end) {
+    var ranges = [];
+    for (var i = start; i < end;) {
+      var n = idx.nodeOf[i], from = idx.offsetOf[i], to = from + 1;
+      while (i + 1 < end && idx.nodeOf[i + 1] === n) {
+        i++;
+        to = idx.offsetOf[i] + 1;
+      }
+      i++;
+      var range = document.createRange();
+      range.setStart(idx.nodes[n], from);
+      range.setEnd(idx.nodes[n], to);
+      ranges.push(range);
+    }
+    return ranges;
+  }
+  function draw() {
+    if (overlay && overlay.parentNode) overlay.parentNode.removeChild(overlay);
+    overlay = null;
+    if (!current) return;
+    overlay = document.createElement('div');
+    overlay.style.cssText = 'position:absolute;left:0;top:0;width:0;height:0;pointer-events:none;z-index:2147483647;';
+    current.ranges.forEach(function(range) {
+      var rects = range.getClientRects();
+      for (var i = 0; i < rects.length; i++) {
+        var r = rects[i];
+        if (r.width < 1 || r.height < 1) continue;
+        var box = document.createElement('div');
+        box.style.cssText = 'position:absolute;border-radius:2px;background:' + current.color +
+          ';left:' + (r.left + window.pageXOffset) + 'px;top:' + (r.top + window.pageYOffset) +
+          'px;width:' + r.width + 'px;height:' + r.height + 'px;';
+        overlay.appendChild(box);
+      }
+    });
+    document.documentElement.appendChild(overlay);
+  }
+  window.addEventListener('resize', draw);
+  return {
+    highlight: function(text, fraction, color, scroll) {
+      current = null;
+      var idx = text ? getIndex() : null;
+      var pos = idx ? find(idx, text, fraction) : -1;
+      if (pos >= 0) current = { ranges: rangesFor(idx, pos, pos + text.length), color: color };
+      draw();
+      if (!scroll || !current) return;
+      var rect = null, height = window.innerHeight;
+      for (var i = 0; !rect && i < current.ranges.length; i++) {
+        var r = current.ranges[i].getBoundingClientRect();
+        if (r.width >= 1 && r.height >= 1) rect = r;
+      }
+      // Hidden text has no box to scroll to.
+      if (rect && (rect.top < height * 0.12 || rect.top > height * 0.75)) window.scrollBy(0, rect.top - height * 0.25);
+    },
+    probe: function() {
+      var idx = getIndex();
+      if (!idx) return null;
+      var width = window.innerWidth, height = window.innerHeight, pos = -1, visible = false;
+      if (current && current.ranges.length) {
+        var first = current.ranges[0].getBoundingClientRect();
+        var last = current.ranges[current.ranges.length - 1].getBoundingClientRect();
+        visible = last.bottom > 0 && first.top < height;
+      }
+      for (var y = 4; pos < 0 && y < height / 2 && document.caretRangeFromPoint; y += 12) {
+        var caret = document.caretRangeFromPoint(width / 2, y);
+        var n = caret && caret.startContainer.nodeType === 3 ? idx.nodes.indexOf(caret.startContainer) : -1;
+        if (n < 0) continue;
+        pos = idx.starts[n];
+        while (pos < idx.nodeOf.length && idx.nodeOf[pos] === n && idx.offsetOf[pos] < caret.startOffset) pos++;
+      }
+      if (pos < 0) {
+        var maxScroll = document.documentElement.scrollHeight - height;
+        pos = Math.round((maxScroll > 0 ? window.pageYOffset / maxScroll : 0) * idx.text.length);
+      }
+      return { text: idx.text.substr(pos, 80), fraction: pos / Math.max(1, idx.text.length), visible: visible };
+    }
+  };
+})();
+"""
+
+internal fun injectReadAloudScript(webView: WebView) {
+    webView.evaluateJavascript(ReadAloudScript, null)
+}
+
+/**
+ * Highlights the spoken [segment] in the page, scrolling it into view when [scroll] is set;
+ * null clears the highlight. Needs [injectReadAloudScript] first.
+ */
+internal fun applyReadAloudHighlight(
+    webView: WebView,
+    segment: ReadAloudSegment?,
+    color: String,
+    scroll: Boolean,
+) {
+    val text = segment?.text?.let(JSONObject::quote) ?: "null"
+    val fraction = segment?.fraction ?: 0f
+    webView.evaluateJavascript(
+        "window.__areadaTts && window.__areadaTts.highlight($text, $fraction, ${JSONObject.quote(color)}, $scroll);",
+        null,
+    )
+}
+
+/**
+ * Reports what the page shows at the top of the screen and whether the highlight is visible.
+ * Needs [injectReadAloudScript] first.
+ */
+internal fun probeReadAloudStart(
+    webView: WebView,
+    onResult: (ReadAloudProbe) -> Unit,
+) {
+    webView.evaluateJavascript("window.__areadaTts ? window.__areadaTts.probe() : null;") { value ->
+        val json = runCatching { JSONObject(value) }.getOrNull()
+        onResult(
+            ReadAloudProbe(
+                text = json?.optString("text").orEmpty(),
+                fraction = json?.optDouble("fraction", 0.0)?.toFloat() ?: 0f,
+                highlightVisible = json?.optBoolean("visible") == true,
+            ),
+        )
+    }
+}

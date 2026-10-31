@@ -1,0 +1,429 @@
+package app.areada.ui.reader
+
+import android.app.Application
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
+import android.media.MediaMetadata
+import android.media.session.MediaSession
+import android.media.session.PlaybackState
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
+import android.widget.Toast
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import app.areada.R
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.util.Locale
+
+/** How many utterances are handed to the TTS engine ahead of the one being spoken. */
+private const val QueueAhead = 2
+
+/**
+ * Reads a book aloud independently of the UI, so it keeps going (and reacts to headset buttons)
+ * while the screen is off. Screens only observe [state] and tell the player where to start.
+ */
+internal class ReadAloudViewModel(application: Application) : AndroidViewModel(application) {
+    private val context = application.applicationContext
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val audioManager = context.getSystemService(AudioManager::class.java)
+    private val speechAttributes = AudioAttributes.Builder()
+        .setUsage(AudioAttributes.USAGE_MEDIA)
+        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+        .build()
+
+    var state by mutableStateOf<ReadAloudState?>(null)
+        private set
+
+    /** Chapter the player moved on to by itself; the reader opens it and calls [chapterOpened]. */
+    var chapterToOpen by mutableStateOf<Int?>(null)
+        private set
+
+    private var tts: TextToSpeech? = null
+    private var ttsReady = false
+    private var pendingSpeech: (() -> Unit)? = null
+    private var mediaSession: MediaSession? = null
+    private var focusRequest: AudioFocusRequest? = null
+    private var resumeOnFocusGain = false
+    private var noisyReceiverRegistered = false
+
+    private var book: ReadAloudBook? = null
+    private var chapterIndex = 0
+    private var segments: List<ReadAloudSegment> = emptyList()
+    private var segmentIndex = -1
+    /** How the start segment of the current chapter is picked once it has loaded. */
+    private var pickStart: (List<ReadAloudSegment>) -> Int = { 0 }
+    private var queuedUntil = -1
+    private var finished = false
+    private var generation = 0
+    private var loadJob: Job? = null
+
+    private val progressListener = object : UtteranceProgressListener() {
+        override fun onStart(utteranceId: String) {
+            dispatch(utteranceId) { index ->
+                segmentIndex = index
+                setState(state?.copy(segment = segments[index]))
+            }
+        }
+
+        override fun onDone(utteranceId: String) {
+            dispatch(utteranceId) { index ->
+                if (index == segments.lastIndex) {
+                    onChapterFinished()
+                } else {
+                    segmentIndex = index + 1
+                    enqueueAhead()
+                }
+            }
+        }
+
+        @Deprecated("Deprecated in Java")
+        override fun onError(utteranceId: String) {
+            dispatch(utteranceId) { fail(R.string.read_aloud_failed) }
+        }
+    }
+
+    private val focusListener = AudioManager.OnAudioFocusChangeListener { change ->
+        when (change) {
+            AudioManager.AUDIOFOCUS_GAIN -> if (resumeOnFocusGain) {
+                resumeOnFocusGain = false
+                resume()
+            }
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> if (state?.playing == true) {
+                pause(abandonFocus = false)
+                resumeOnFocusGain = true
+            }
+            AudioManager.AUDIOFOCUS_LOSS -> {
+                resumeOnFocusGain = false
+                pause()
+            }
+        }
+    }
+
+    private val noisyReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            pause()
+        }
+    }
+
+    /**
+     * Starts reading [book] at [chapterIndex]. When [resumeAllowed], continues from the segment
+     * reading was paused on (if it is still there); otherwise starts at [startIndex].
+     */
+    fun play(
+        book: ReadAloudBook,
+        chapterIndex: Int,
+        resumeAllowed: Boolean,
+        startIndex: (List<ReadAloudSegment>) -> Int,
+    ) {
+        val pausedSegment = state
+            ?.takeIf { resumeAllowed && it.documentUri == book.documentUri && it.chapterIndex == chapterIndex }
+            ?.segment
+        startChapter(book, chapterIndex) { loaded ->
+            pausedSegment
+                ?.let { segment -> loaded.indexOfFirst { it.start == segment.start && it.text == segment.text } }
+                ?.takeIf { it >= 0 }
+                ?: startIndex(loaded)
+        }
+    }
+
+    /** Continues after a pause, e.g. from a headset button. */
+    fun resume() {
+        val currentBook = book ?: return
+        if (state?.playing != false || finished) return
+        if (segmentIndex in segments.indices) {
+            if (beginPlayback(currentBook.title)) {
+                speakFrom(segmentIndex)
+            }
+        } else {
+            // Paused while the chapter was loading: start where the reader originally asked to.
+            startChapter(currentBook, chapterIndex, pickStart)
+        }
+    }
+
+    fun pause() = pause(abandonFocus = true)
+
+    /** Restarts reading at the start of [chapterIndex] if the user navigated there while reading. */
+    fun followChapter(documentUri: String, chapterIndex: Int) {
+        val currentBook = book ?: return
+        val current = state ?: return
+        if (current.playing && current.documentUri == documentUri && current.chapterIndex != chapterIndex) {
+            startChapter(currentBook, chapterIndex) { 0 }
+        }
+    }
+
+    /** Ends reading of [documentUri] completely, e.g. when its reader is closed. */
+    fun stop(documentUri: String) {
+        if (state?.documentUri != documentUri) return
+        haltSpeech()
+        endPlayback()
+        book = null
+        segments = emptyList()
+        segmentIndex = -1
+        chapterToOpen = null
+        setState(null)
+    }
+
+    fun chapterOpened() {
+        chapterToOpen = null
+    }
+
+    override fun onCleared() {
+        haltSpeech()
+        endPlayback()
+        tts?.shutdown()
+        tts = null
+        mediaSession?.release()
+        mediaSession = null
+    }
+
+    private fun pause(abandonFocus: Boolean) {
+        if (state?.playing != true) return
+        haltSpeech()
+        if (abandonFocus) {
+            endPlayback()
+        }
+        setState(state?.copy(playing = false))
+    }
+
+    private fun startChapter(
+        book: ReadAloudBook,
+        chapterIndex: Int,
+        pickIndex: (List<ReadAloudSegment>) -> Int,
+    ) {
+        // Without focus (e.g. during a call) nothing changes, so the paused position survives.
+        if (!beginPlayback(book.title)) return
+        haltSpeech()
+        this.book = book
+        this.chapterIndex = chapterIndex
+        segments = emptyList()
+        segmentIndex = -1
+        pickStart = pickIndex
+        finished = false
+        setState(ReadAloudState(book.documentUri, chapterIndex, segment = null, playing = true))
+        loadJob = viewModelScope.launch {
+            val loaded = try {
+                withContext(Dispatchers.Default) { book.loadChapter(chapterIndex) }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Throwable) {
+                fail(R.string.unable_render_section)
+                return@launch
+            }
+            segments = loaded
+            if (loaded.isEmpty()) {
+                onChapterFinished()
+            } else {
+                speakFrom(pickIndex(loaded).coerceIn(0, loaded.lastIndex))
+            }
+        }
+    }
+
+    private fun onChapterFinished() {
+        val currentBook = book ?: return
+        if (chapterIndex + 1 < currentBook.chapterCount) {
+            startChapter(currentBook, chapterIndex + 1) { 0 }
+            chapterToOpen = chapterIndex
+            return
+        }
+        haltSpeech()
+        endPlayback()
+        finished = true
+        segmentIndex = -1
+        setState(state?.copy(segment = null, playing = false))
+    }
+
+    private fun speakFrom(index: Int) {
+        val engine = tts
+        if (engine == null || !ttsReady) {
+            pendingSpeech = { speakFrom(index) }
+            if (engine == null) {
+                // Init status may arrive synchronously from the constructor, so handle it after assignment.
+                tts = TextToSpeech(context) { status -> mainHandler.post { onTtsInit(status) } }
+            }
+            return
+        }
+        generation += 1
+        segmentIndex = index
+        queuedUntil = index - 1
+        applyLanguage(engine, book?.language)
+        setState(state?.copy(segment = segments[index], playing = true))
+        engine.stop()
+        enqueueAhead()
+    }
+
+    private fun enqueueAhead() {
+        val engine = tts ?: return
+        while (queuedUntil < segments.lastIndex && queuedUntil < segmentIndex + QueueAhead) {
+            queuedUntil += 1
+            val result = engine.speak(
+                segments[queuedUntil].text,
+                TextToSpeech.QUEUE_ADD,
+                null,
+                "$generation:$queuedUntil",
+            )
+            if (result != TextToSpeech.SUCCESS) {
+                fail(R.string.read_aloud_unavailable)
+                return
+            }
+        }
+    }
+
+    private fun onTtsInit(status: Int) {
+        val engine = tts ?: return
+        if (status != TextToSpeech.SUCCESS) {
+            engine.shutdown()
+            tts = null
+            pendingSpeech = null
+            fail(R.string.read_aloud_unavailable)
+            return
+        }
+        ttsReady = true
+        engine.setOnUtteranceProgressListener(progressListener)
+        engine.setAudioAttributes(speechAttributes)
+        pendingSpeech?.also { pendingSpeech = null }?.invoke()
+    }
+
+    private fun applyLanguage(engine: TextToSpeech, language: String?) {
+        val locale = language
+            ?.takeIf { it.isNotBlank() }
+            ?.let { Locale.forLanguageTag(it.replace('_', '-')) }
+            ?.takeIf { it.language.isNotEmpty() }
+        if (locale != null && engine.isLanguageAvailable(locale) >= TextToSpeech.LANG_AVAILABLE) {
+            engine.setLanguage(locale)
+        } else {
+            engine.defaultVoice?.let(engine::setVoice)
+        }
+    }
+
+    /** Stops the current utterances and invalidates their pending callbacks. */
+    private fun haltSpeech() {
+        generation += 1
+        pendingSpeech = null
+        loadJob?.cancel()
+        loadJob = null
+        if (ttsReady) {
+            tts?.stop()
+        }
+    }
+
+    private fun fail(messageRes: Int) {
+        haltSpeech()
+        endPlayback()
+        setState(state?.copy(playing = false))
+        Toast.makeText(context, messageRes, Toast.LENGTH_SHORT).show()
+    }
+
+    /** Takes audio focus and the media session; false when the system refuses focus (e.g. during a call). */
+    private fun beginPlayback(title: String): Boolean {
+        val focusResult = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val request = focusRequest ?: AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                .setAudioAttributes(speechAttributes)
+                .setWillPauseWhenDucked(true)
+                .setOnAudioFocusChangeListener(focusListener)
+                .build()
+                .also { focusRequest = it }
+            audioManager.requestAudioFocus(request)
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.requestAudioFocus(focusListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN)
+        }
+        if (focusResult != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+            return false
+        }
+        if (!noisyReceiverRegistered) {
+            ContextCompat.registerReceiver(
+                context,
+                noisyReceiver,
+                IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY),
+                ContextCompat.RECEIVER_NOT_EXPORTED,
+            )
+            noisyReceiverRegistered = true
+        }
+        val session = mediaSession ?: MediaSession(context, "AreadaReadAloud").apply {
+            @Suppress("DEPRECATION")
+            setFlags(MediaSession.FLAG_HANDLES_MEDIA_BUTTONS or MediaSession.FLAG_HANDLES_TRANSPORT_CONTROLS)
+            setCallback(
+                object : MediaSession.Callback() {
+                    override fun onPlay() = resume()
+
+                    override fun onPause() = pause()
+
+                    override fun onStop() = pause()
+                },
+            )
+        }.also { mediaSession = it }
+        session.setMetadata(
+            MediaMetadata.Builder()
+                .putString(MediaMetadata.METADATA_KEY_TITLE, title)
+                .build(),
+        )
+        session.isActive = true
+        return true
+    }
+
+    /** Gives audio focus back; the media session stays active so a headset can resume reading. */
+    private fun endPlayback() {
+        resumeOnFocusGain = false
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            focusRequest?.let(audioManager::abandonAudioFocusRequest)
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.abandonAudioFocus(focusListener)
+        }
+        if (noisyReceiverRegistered) {
+            context.unregisterReceiver(noisyReceiver)
+            noisyReceiverRegistered = false
+        }
+    }
+
+    private fun setState(newState: ReadAloudState?) {
+        state = newState
+        val session = mediaSession ?: return
+        if (newState == null) {
+            session.isActive = false
+            return
+        }
+        session.setPlaybackState(
+            PlaybackState.Builder()
+                .setActions(
+                    PlaybackState.ACTION_PLAY or
+                        PlaybackState.ACTION_PAUSE or
+                        PlaybackState.ACTION_PLAY_PAUSE or
+                        PlaybackState.ACTION_STOP,
+                )
+                .setState(
+                    if (newState.playing) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED,
+                    PlaybackState.PLAYBACK_POSITION_UNKNOWN,
+                    1f,
+                )
+                .build(),
+        )
+    }
+
+    private fun dispatch(utteranceId: String, action: (Int) -> Unit) {
+        val utteranceGeneration = utteranceId.substringBefore(':').toIntOrNull() ?: return
+        val index = utteranceId.substringAfter(':').toIntOrNull() ?: return
+        mainHandler.post {
+            if (utteranceGeneration == generation && index in segments.indices) {
+                action(index)
+            }
+        }
+    }
+}

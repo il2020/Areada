@@ -43,6 +43,8 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.layout.onSizeChanged
@@ -227,6 +229,11 @@ internal fun TextReaderScreen(
     var noteStructureEditedSinceOpen by remember(screen.document.uriString) {
         mutableStateOf(false)
     }
+    val readAloud = rememberReadAloud(screen.document.uriString)
+    val playerSegment = readAloud.segmentIn(0)
+    // Hidden once the text under it changes (edits, another note section).
+    val readAloudSegment = remember(playerSegment, text) { playerSegment?.takeIf { it.matchesSource(text) } }
+    val readAloudHighlightColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.28f)
     val scrollState = rememberScrollState()
     val coroutineScope = rememberCoroutineScope()
     var editorHeightPx by remember(screen.document.uriString) {
@@ -683,6 +690,47 @@ internal fun TextReaderScreen(
         }
     }
 
+    LaunchedEffect(readAloudSegment) {
+        val segment = readAloudSegment ?: return@LaunchedEffect
+        // The layout can lag behind the text for a frame, e.g. right after an undo.
+        val layout = noteTextLayoutRef.value
+            ?.takeIf { segment.end <= it.layoutInput.text.length }
+            ?: return@LaunchedEffect
+        val line = layout.getLineForOffset(segment.start)
+        val lineTop = layout.getLineTop(line).roundToInt()
+        val lineBottom = layout.getLineBottom(line).roundToInt()
+        if (lineTop < scrollState.value || lineBottom > scrollState.value + editorHeightPx) {
+            scrollState.animateScrollTo(lineTop.coerceIn(0, scrollState.maxValue))
+        }
+    }
+
+    fun toggleReadAloud() {
+        if (readAloud.playing) {
+            readAloud.pause()
+            return
+        }
+        val snapshot = text
+        val layout = noteTextLayoutRef.value
+        val topOffset = layout?.getOffsetForPosition(Offset(0f, scrollState.value.toFloat())) ?: 0
+        val pausedSegmentVisible = layout != null &&
+            readAloudSegment != null &&
+            readAloudSegment.end <= layout.layoutInput.text.length &&
+            layout.getLineForOffset(readAloudSegment.start).let { line ->
+                layout.getLineBottom(line) > scrollState.value &&
+                    layout.getLineTop(line) < scrollState.value + editorHeightPx
+            }
+        readAloud.play(
+            book = ReadAloudBook(
+                documentUri = screen.document.uriString,
+                title = screen.document.title,
+                language = null,
+                chapterCount = 1,
+            ) { plainTextReadAloudSegments(snapshot) },
+            chapterIndex = 0,
+            resumeAllowed = pausedSegmentVisible,
+        ) { segments -> segments.indexOfLast { it.start <= topOffset }.coerceAtLeast(0) }
+    }
+
     if (showSettings) {
         ReaderSettingsSheet(
             preferences = preferences,
@@ -793,7 +841,7 @@ internal fun TextReaderScreen(
     }
     KeepReaderScreenAwake(enabled = preferences.keepScreenOn)
     VolumePageTurnEffect(
-        enabled = preferences.volumeButtonsTurnPages && !showSettings && !showNoteSearch,
+        enabled = preferences.volumeButtonsTurnPages && !showSettings && !showNoteSearch && !readAloud.playing,
         inverted = preferences.invertVolumeButtons,
         onPrevious = {
             coroutineScope.launch {
@@ -862,6 +910,10 @@ internal fun TextReaderScreen(
                         Text(text = stringResource(R.string.save))
                     }
                 }
+                ReadAloudButton(
+                    isReadingAloud = readAloud.playing,
+                    onClick = ::toggleReadAloud,
+                )
                 IconButton(onClick = { onToggleBookmark(currentScrollFraction) }) {
                     Icon(
                         imageVector = if (currentBookmarked) Icons.Outlined.Bookmark else Icons.Outlined.BookmarkBorder,
@@ -939,7 +991,14 @@ internal fun TextReaderScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     .onSizeChanged { size -> editorHeightPx = size.height }
-                    .verticalScroll(scrollState),
+                    .verticalScroll(scrollState)
+                    .drawBehind {
+                        val segment = readAloudSegment ?: return@drawBehind
+                        val layout = noteTextLayoutRef.value ?: return@drawBehind
+                        if (segment.end <= layout.layoutInput.text.length) {
+                            drawPath(layout.getPathForRange(segment.start, segment.end), readAloudHighlightColor)
+                        }
+                    },
                 readOnly = !isEditable,
                 textStyle = MaterialTheme.typography.bodyLarge.copy(
                     color = textColor,

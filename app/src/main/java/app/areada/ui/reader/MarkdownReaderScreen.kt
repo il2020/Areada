@@ -57,6 +57,7 @@ internal fun MarkdownReaderScreen(
     var isImmersiveMode by remember(screen.document.uriString) { mutableStateOf(true) }
     var immersiveControlsVisible by rememberSaveable(screen.document.uriString) { mutableStateOf(false) }
     var noteText by rememberSaveable(screen.document.uriString) { mutableStateOf<String?>(null) }
+    val readAloud = rememberReadAloud(screen.document.uriString)
     var scrollFraction by rememberSaveable(screen.document.uriString) {
         mutableFloatStateOf(screen.initialScrollFraction.coerceIn(0f, 1f))
     }
@@ -117,6 +118,19 @@ internal fun MarkdownReaderScreen(
             .onFailure { throwable -> chapterError = displayError(context, throwable, renderSectionErrorMessage) }
     }
 
+    fun readAloudBook(): ReadAloudBook {
+        val shownHtml = renderedChapter?.html
+        return ReadAloudBook(
+            documentUri = screen.document.uriString,
+            title = screen.document.title,
+            language = null,
+            chapterCount = 1,
+        ) {
+            val html = shownHtml ?: MarkdownEngine.render(screen.book, 0, preferences, paletteOverride = null).html
+            htmlReadAloudSegments(html)
+        }
+    }
+
     BackHandler(enabled = showSettings) { showSettings = false }
     BackHandler(enabled = showChapterSearch) {
         showChapterSearch = false
@@ -124,7 +138,7 @@ internal fun MarkdownReaderScreen(
     }
     KeepReaderScreenAwake(enabled = preferences.keepScreenOn)
     VolumePageTurnEffect(
-        enabled = preferences.volumeButtonsTurnPages && !showSettings && !showChapterSearch,
+        enabled = preferences.volumeButtonsTurnPages && !showSettings && !showChapterSearch && !readAloud.playing,
         inverted = preferences.invertVolumeButtons,
         onPrevious = {},
         onNext = {},
@@ -189,6 +203,10 @@ internal fun MarkdownReaderScreen(
                             chapterSearchCurrent = current
                             chapterSearchCount = count
                         },
+                        readAloudSegment = readAloud.segmentIn(0),
+                        readAloudPlaying = readAloud.playing,
+                        readAloudProbeRequest = readAloud.probeRequest,
+                        onReadAloudProbe = readAloud::onProbe,
                     )
                 }
             }
@@ -224,6 +242,10 @@ internal fun MarkdownReaderScreen(
                         onToggleBookmark(0, 1, scrollFraction, chapterTitle)
                     },
                     isBookmarked = currentBookmarked,
+                    onReadAloudToggle = {
+                        readAloud.toggleForPage(readAloudBook(), 0, pageShown = renderedChapter != null)
+                    },
+                    isReadingAloud = readAloud.playing,
                 )
             }
             Box(

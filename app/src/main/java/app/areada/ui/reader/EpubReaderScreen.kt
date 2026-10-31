@@ -86,6 +86,7 @@ internal fun EpubReaderScreen(
     var showGoToChapter by rememberSaveable(screen.document.uriString) {
         mutableStateOf(false)
     }
+    val readAloud = rememberReadAloud(screen.document.uriString)
     var showChapterSearch by rememberSaveable(screen.document.uriString) {
         mutableStateOf(false)
     }
@@ -201,6 +202,7 @@ internal fun EpubReaderScreen(
         chapterSearchCurrent = 0
         chapterSearchCount = 0
         onSaveProgress(nextIndex, screen.book.chapters.size, targetFraction)
+        readAloud.followChapter(nextIndex)
     }
 
     val hapticFeedback = LocalHapticFeedback.current
@@ -323,6 +325,23 @@ internal fun EpubReaderScreen(
         }
     }
 
+    fun readAloudBook(): ReadAloudBook {
+        val shownIndex = chapterIndex
+        val shownHtml = renderedChapter?.html
+        return ReadAloudBook(
+            documentUri = screen.document.uriString,
+            title = screen.document.title,
+            language = screen.book.language,
+            chapterCount = screen.book.chapters.size,
+        ) { index ->
+            val html = shownHtml?.takeIf { index == shownIndex }
+                ?: EpubEngine.render(screen.book, index, preferences).html
+            htmlReadAloudSegments(html)
+        }
+    }
+
+    ReadAloudChapterSync(readAloud, ::switchToChapter)
+
     if (showSettings) {
         ReaderSettingsSheet(
             preferences = preferences,
@@ -368,7 +387,8 @@ internal fun EpubReaderScreen(
         enabled = preferences.volumeButtonsTurnPages &&
             !showSettings &&
             !showGoToChapter &&
-            !showChapterSearch,
+            !showChapterSearch &&
+            !readAloud.playing,
         inverted = preferences.invertVolumeButtons,
         onPrevious = ::goToPreviousChapter,
         onNext = ::goToNextChapter,
@@ -447,6 +467,10 @@ internal fun EpubReaderScreen(
                                 chapterSearchCurrent = current
                                 chapterSearchCount = count
                             },
+                            readAloudSegment = readAloud.segmentIn(chapterIndex),
+                            readAloudPlaying = readAloud.playing,
+                            readAloudProbeRequest = readAloud.probeRequest,
+                            onReadAloudProbe = readAloud::onProbe,
                         )
                     }
                 }
@@ -492,6 +516,10 @@ internal fun EpubReaderScreen(
                             )
                         },
                         isBookmarked = currentBookmarked,
+                        onReadAloudToggle = {
+                            readAloud.toggleForPage(readAloudBook(), chapterIndex, pageShown = renderedChapter != null)
+                        },
+                        isReadingAloud = readAloud.playing,
                     )
                 }
                 Box(

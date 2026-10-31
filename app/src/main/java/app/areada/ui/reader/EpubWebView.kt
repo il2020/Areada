@@ -14,6 +14,7 @@ import android.webkit.WebViewClient
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
@@ -51,8 +52,21 @@ internal fun EpubWebView(
     searchRequest: Int,
     searchBackwards: Boolean,
     onSearchResult: (current: Int, count: Int) -> Unit,
+    readAloudSegment: ReadAloudSegment? = null,
+    readAloudPlaying: Boolean = false,
+    readAloudProbeRequest: Int = 0,
+    onReadAloudProbe: (ReadAloudProbe) -> Unit = {},
 ) {
     val backgroundColor = AndroidColor.parseColor(renderPalette.backgroundHex)
+    val readAloudHighlightColor = remember(renderPalette.accentHex) {
+        val accent = AndroidColor.parseColor(renderPalette.accentHex)
+        "rgba(${AndroidColor.red(accent)}, ${AndroidColor.green(accent)}, ${AndroidColor.blue(accent)}, 0.28)"
+    }
+    val latestReadAloudSegment by rememberUpdatedState(readAloudSegment)
+    val latestReadAloudPlaying by rememberUpdatedState(readAloudPlaying)
+    val latestReadAloudHighlightColor by rememberUpdatedState(readAloudHighlightColor)
+    val latestReadAloudProbeRequest by rememberUpdatedState(readAloudProbeRequest)
+    val latestOnReadAloudProbe by rememberUpdatedState(onReadAloudProbe)
     val latestScrollRequest by rememberUpdatedState(scrollRequest)
     val latestNavigationMode by rememberUpdatedState(navigationMode)
     val latestOnScrollProgressChange by rememberUpdatedState(onScrollProgressChange)
@@ -67,6 +81,15 @@ internal fun EpubWebView(
     val latestScrollEventId by rememberUpdatedState(scrollEventId)
     val latestScrollEventPixels by rememberUpdatedState(scrollEventPixels)
     val chapterSignature = "${chapter.baseUrl}#${chapter.html.hashCode()}"
+
+    // Answers each probe request once; a request made while the page loads waits for onPageFinished.
+    fun probeReadAloudIfRequested(webView: WebView) {
+        val request = latestReadAloudProbeRequest
+        if (request != 0 && webView.getTag(R.id.tag_read_aloud_probe) != request) {
+            webView.setTag(R.id.tag_read_aloud_probe, request)
+            probeReadAloudStart(webView) { probe -> latestOnReadAloudProbe(probe) }
+        }
+    }
 
     AndroidView(
         factory = { context ->
@@ -135,6 +158,18 @@ internal fun EpubWebView(
                         view.postDelayed({ publishScrollState(force = true) }, 170L)
                         view.postDelayed({ publishScrollState(force = true) }, 360L)
                         injectNoteHandler(view)
+                        injectReadAloudScript(view)
+                        view.setTag(R.id.tag_read_aloud_page_ready, true)
+                        latestReadAloudSegment?.let { segment ->
+                            view.setTag(R.id.tag_read_aloud_segment, segment)
+                            applyReadAloudHighlight(
+                                webView = view,
+                                segment = segment,
+                                color = latestReadAloudHighlightColor,
+                                scroll = latestReadAloudPlaying,
+                            )
+                        }
+                        probeReadAloudIfRequested(view)
                         applyEpubChapterSearch(
                             webView = view,
                             query = searchQuery,
@@ -284,6 +319,7 @@ internal fun EpubWebView(
         update = { webView ->
             if (webView.tag != chapterSignature) {
                 webView.tag = chapterSignature
+                webView.setTag(R.id.tag_read_aloud_page_ready, false)
                 webView.loadDataWithBaseURL(
                     chapter.baseUrl,
                     chapter.html,
@@ -316,6 +352,21 @@ internal fun EpubWebView(
                 backwards = searchBackwards,
                 onSearchResult = onSearchResult,
             )
+            val readAloudPageReady = webView.getTag(R.id.tag_read_aloud_page_ready) == true
+            if (webView.getTag(R.id.tag_read_aloud_segment) != readAloudSegment) {
+                webView.setTag(R.id.tag_read_aloud_segment, readAloudSegment)
+                if (readAloudPageReady) {
+                    applyReadAloudHighlight(
+                        webView = webView,
+                        segment = readAloudSegment,
+                        color = readAloudHighlightColor,
+                        scroll = readAloudPlaying,
+                    )
+                }
+            }
+            if (readAloudPageReady) {
+                probeReadAloudIfRequested(webView)
+            }
         },
         onRelease = { webView ->
             webView.stopLoading()

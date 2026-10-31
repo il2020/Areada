@@ -115,6 +115,10 @@
     <string name="no_entries_available">No hay entradas disponibles.</string>
     <string name="add_bookmark">Añadir marcador</string>
     <string name="remove_bookmark">Eliminar marcador</string>
+    <string name="read_aloud">Leer en voz alta</string>
+    <string name="pause_read_aloud">Pausar lectura en voz alta</string>
+    <string name="read_aloud_unavailable">La conversión de texto a voz no está disponible en este dispositivo</string>
+    <string name="read_aloud_failed">No se pudo leer este fragmento en voz alta</string>
     <string name="undo">Deshacer</string>
     <string name="redo">Rehacer</string>
     <string name="insert_timestamp">Insertar marca de tiempo</string>

@@ -76,6 +76,7 @@ internal fun Fb2ReaderScreen(
     var showGoToChapter by rememberSaveable(screen.document.uriString) {
         mutableStateOf(false)
     }
+    val readAloud = rememberReadAloud(screen.document.uriString)
     var chapterIndex by rememberSaveable(screen.document.uriString) {
         mutableIntStateOf(
             screen.initialChapterIndex.coerceIn(
@@ -158,6 +159,7 @@ internal fun Fb2ReaderScreen(
         scrollFraction = targetFraction
         chapterIndex = nextIndex
         onSaveProgress(nextIndex, screen.book.chapters.size, targetFraction)
+        readAloud.followChapter(nextIndex)
     }
 
     val hapticFeedback = LocalHapticFeedback.current
@@ -219,6 +221,23 @@ internal fun Fb2ReaderScreen(
             }
     }
 
+    fun readAloudBook(): ReadAloudBook {
+        val shownIndex = chapterIndex
+        val shownHtml = renderedChapter?.html
+        return ReadAloudBook(
+            documentUri = screen.document.uriString,
+            title = screen.document.title,
+            language = screen.book.language,
+            chapterCount = screen.book.chapters.size,
+        ) { index ->
+            val html = shownHtml?.takeIf { index == shownIndex }
+                ?: Fb2Engine.render(screen.book, index, preferences, paletteOverride = null).html
+            htmlReadAloudSegments(html)
+        }
+    }
+
+    ReadAloudChapterSync(readAloud, ::switchToChapter)
+
     if (showSettings) {
         ReaderSettingsSheet(
             preferences = preferences,
@@ -245,7 +264,7 @@ internal fun Fb2ReaderScreen(
     BackHandler(enabled = showToc) { showToc = false }
     KeepReaderScreenAwake(enabled = preferences.keepScreenOn)
     VolumePageTurnEffect(
-        enabled = preferences.volumeButtonsTurnPages && !showSettings && !showGoToChapter,
+        enabled = preferences.volumeButtonsTurnPages && !showSettings && !showGoToChapter && !readAloud.playing,
         inverted = preferences.invertVolumeButtons,
         onPrevious = ::goToPreviousChapter,
         onNext = ::goToNextChapter,
@@ -317,6 +336,10 @@ internal fun Fb2ReaderScreen(
                             searchRequest = 0,
                             searchBackwards = false,
                             onSearchResult = { _, _ -> },
+                            readAloudSegment = readAloud.segmentIn(chapterIndex),
+                            readAloudPlaying = readAloud.playing,
+                            readAloudProbeRequest = readAloud.probeRequest,
+                            onReadAloudProbe = readAloud::onProbe,
                         )
                     }
                 }
@@ -362,6 +385,10 @@ internal fun Fb2ReaderScreen(
                             )
                         },
                         isBookmarked = currentBookmarked,
+                        onReadAloudToggle = {
+                            readAloud.toggleForPage(readAloudBook(), chapterIndex, pageShown = renderedChapter != null)
+                        },
+                        isReadingAloud = readAloud.playing,
                     )
                 }
                 Box(

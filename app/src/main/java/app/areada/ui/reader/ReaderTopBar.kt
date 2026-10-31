@@ -7,8 +7,10 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Bookmark
 import androidx.compose.material.icons.outlined.BookmarkBorder
 import androidx.compose.material.icons.automirrored.outlined.FormatListBulleted
+import androidx.compose.material.icons.automirrored.outlined.VolumeUp
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material.icons.outlined.Pause
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -37,6 +39,8 @@ internal fun ReaderTopBar(
     onTableOfContents: (() -> Unit)? = null,
     onBookmarkToggle: (() -> Unit)? = null,
     isBookmarked: Boolean = false,
+    onReadAloudToggle: (() -> Unit)? = null,
+    isReadingAloud: Boolean = false,
 ) {
     TopAppBar(
         colors = TopAppBarDefaults.topAppBarColors(
@@ -106,6 +110,9 @@ internal fun ReaderTopBar(
                     )
                 }
             }
+            onReadAloudToggle?.let { toggleReadAloud ->
+                ReadAloudButton(isReadingAloud = isReadingAloud, onClick = toggleReadAloud)
+            }
             onSettings?.let { openSettings ->
                 IconButton(onClick = openSettings) {
                     Icon(
@@ -116,4 +123,22 @@ internal fun ReaderTopBar(
             }
         },
     )
+}
+
+@Composable
+internal fun ReadAloudButton(
+    isReadingAloud: Boolean,
+    onClick: () -> Unit,
+) {
+    IconButton(onClick = onClick) {
+        Icon(
+            imageVector = if (isReadingAloud) Icons.Outlined.Pause else Icons.AutoMirrored.Outlined.VolumeUp,
+            contentDescription = if (isReadingAloud) {
+                stringResource(R.string.pause_read_aloud)
+            } else {
+                stringResource(R.string.read_aloud)
+            },
+            tint = if (isReadingAloud) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+        )
+    }
 }

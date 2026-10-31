@@ -119,6 +119,10 @@
     <string name="no_entries_available">无可用条目.</string>
     <string name="add_bookmark">添加书签</string>
     <string name="remove_bookmark">移除书签</string>
+    <string name="read_aloud">朗读</string>
+    <string name="pause_read_aloud">暂停朗读</string>
+    <string name="read_aloud_unavailable">此设备不支持文字转语音</string>
+    <string name="read_aloud_failed">无法朗读此段落</string>
     <string name="undo">撤消</string>
     <string name="redo">重做</string>
     <string name="insert_timestamp">插入时间戳</string>
