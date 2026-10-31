@@ -77,7 +77,7 @@ internal class ReadAloudViewModel(application: Application) : AndroidViewModel(a
         override fun onStart(utteranceId: String) {
             dispatch(utteranceId) { index ->
                 segmentIndex = index
-                setState(state?.copy(segment = segments[index]))
+                updateState(state?.copy(segment = segments[index]))
             }
         }
 
@@ -177,7 +177,7 @@ internal class ReadAloudViewModel(application: Application) : AndroidViewModel(a
         segments = emptyList()
         segmentIndex = -1
         chapterToOpen = null
-        setState(null)
+        updateState(null)
     }
 
     fun chapterOpened() {
@@ -199,7 +199,7 @@ internal class ReadAloudViewModel(application: Application) : AndroidViewModel(a
         if (abandonFocus) {
             endPlayback()
         }
-        setState(state?.copy(playing = false))
+        updateState(state?.copy(playing = false))
     }
 
     private fun startChapter(
@@ -216,7 +216,7 @@ internal class ReadAloudViewModel(application: Application) : AndroidViewModel(a
         segmentIndex = -1
         pickStart = pickIndex
         finished = false
-        setState(ReadAloudState(book.documentUri, chapterIndex, segment = null, playing = true))
+        updateState(ReadAloudState(book.documentUri, chapterIndex, segment = null, playing = true))
         loadJob = viewModelScope.launch {
             val loaded = try {
                 withContext(Dispatchers.Default) { book.loadChapter(chapterIndex) }
@@ -246,7 +246,7 @@ internal class ReadAloudViewModel(application: Application) : AndroidViewModel(a
         endPlayback()
         finished = true
         segmentIndex = -1
-        setState(state?.copy(segment = null, playing = false))
+        updateState(state?.copy(segment = null, playing = false))
     }
 
     private fun speakFrom(index: Int) {
@@ -263,7 +263,7 @@ internal class ReadAloudViewModel(application: Application) : AndroidViewModel(a
         segmentIndex = index
         queuedUntil = index - 1
         applyLanguage(engine, book?.language)
-        setState(state?.copy(segment = segments[index], playing = true))
+        updateState(state?.copy(segment = segments[index], playing = true))
         engine.stop()
         enqueueAhead()
     }
@@ -326,7 +326,7 @@ internal class ReadAloudViewModel(application: Application) : AndroidViewModel(a
     private fun fail(messageRes: Int) {
         haltSpeech()
         endPlayback()
-        setState(state?.copy(playing = false))
+        updateState(state?.copy(playing = false))
         Toast.makeText(context, messageRes, Toast.LENGTH_SHORT).show()
     }
 
@@ -393,7 +393,7 @@ internal class ReadAloudViewModel(application: Application) : AndroidViewModel(a
         }
     }
 
-    private fun setState(newState: ReadAloudState?) {
+    private fun updateState(newState: ReadAloudState?) {
         state = newState
         val session = mediaSession ?: return
         if (newState == null) {
