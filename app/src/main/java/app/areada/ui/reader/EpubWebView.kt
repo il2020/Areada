@@ -83,8 +83,7 @@ internal fun EpubWebView(
     val chapterSignature = "${chapter.baseUrl}#${chapter.html.hashCode()}"
 
     // Answers each probe request once; a request made while the page loads waits for onPageFinished.
-    fun probeReadAloudIfRequested(webView: WebView) {
-        val request = latestReadAloudProbeRequest
+    fun probeReadAloudIfRequested(webView: WebView, request: Int) {
         if (request != 0 && webView.getTag(R.id.tag_read_aloud_probe) != request) {
             webView.setTag(R.id.tag_read_aloud_probe, request)
             probeReadAloudStart(webView) { probe -> latestOnReadAloudProbe(probe) }
@@ -169,7 +168,7 @@ internal fun EpubWebView(
                                 scroll = latestReadAloudPlaying,
                             )
                         }
-                        probeReadAloudIfRequested(view)
+                        probeReadAloudIfRequested(view, latestReadAloudProbeRequest)
                         applyEpubChapterSearch(
                             webView = view,
                             query = searchQuery,
@@ -365,7 +364,8 @@ internal fun EpubWebView(
                 }
             }
             if (readAloudPageReady) {
-                probeReadAloudIfRequested(webView)
+                // The parameter, not the State: a new request has to re-create this block to re-run it.
+                probeReadAloudIfRequested(webView, readAloudProbeRequest)
             }
         },
         onRelease = { webView ->
