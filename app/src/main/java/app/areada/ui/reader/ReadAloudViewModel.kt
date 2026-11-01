@@ -1,5 +1,6 @@
 package app.areada.ui.reader
 
+import android.annotation.SuppressLint
 import android.app.Application
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -9,11 +10,13 @@ import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.media.MediaMetadata
+import android.media.MediaPlayer
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.widget.Toast
@@ -29,14 +32,22 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.FileInputStream
 import java.util.Locale
 
-/** How many utterances are handed to the TTS engine ahead of the one being spoken. */
-private const val QueueAhead = 2
+/** How many segments are synthesized ahead of the one being played. */
+private const val SynthesizeAhead = 2
+
+/** Size of the WAV header TextToSpeech writes; a file no longer than this holds no audio. */
+private const val WavHeaderLength = 44
 
 /**
  * Reads a book aloud independently of the UI, so it keeps going (and reacts to headset buttons)
  * while the screen is off. Screens only observe [state] and tell the player where to start.
+ *
+ * Speech is synthesized to files and played here rather than by the TTS engine: Android sends
+ * headset buttons to the app that plays audio itself, and the engine's audio belongs to its process.
  */
 internal class ReadAloudViewModel(application: Application) : AndroidViewModel(application) {
     private val context = application.applicationContext
@@ -57,6 +68,12 @@ internal class ReadAloudViewModel(application: Application) : AndroidViewModel(a
     private var tts: TextToSpeech? = null
     private var ttsReady = false
     private var pendingSpeech: (() -> Unit)? = null
+    private var mediaPlayer: MediaPlayer? = null
+    private val audioDir = File(context.cacheDir, "read_aloud")
+    // Keeps the CPU awake with the screen off while nothing is audible: chapter loading, synthesis.
+    private val wakeLock = context.getSystemService(PowerManager::class.java)
+        .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Areada:ReadAloud")
+        .apply { setReferenceCounted(false) }
     private var mediaSession: MediaSession? = null
     private var focusRequest: AudioFocusRequest? = null
     private var resumeOnFocusGain = false
@@ -68,26 +85,23 @@ internal class ReadAloudViewModel(application: Application) : AndroidViewModel(a
     private var segmentIndex = -1
     /** How the start segment of the current chapter is picked once it has loaded. */
     private var pickStart: (List<ReadAloudSegment>) -> Int = { 0 }
-    private var queuedUntil = -1
+    /** Last segment handed to the engine for synthesis, and the last one whose audio file is ready. */
+    private var synthesizedUntil = -1
+    private var readyUntil = -1
+    /** Whether [segmentIndex] is playing; otherwise its audio is still being synthesized. */
+    private var segmentPlaying = false
     private var finished = false
     private var generation = 0
     private var loadJob: Job? = null
 
-    private val progressListener = object : UtteranceProgressListener() {
-        override fun onStart(utteranceId: String) {
-            dispatch(utteranceId) { index ->
-                segmentIndex = index
-                updateState(state?.copy(segment = segments[index]))
-            }
-        }
+    private val synthesisListener = object : UtteranceProgressListener() {
+        override fun onStart(utteranceId: String) = Unit
 
         override fun onDone(utteranceId: String) {
             dispatch(utteranceId) { index ->
-                if (index == segments.lastIndex) {
-                    onChapterFinished()
-                } else {
-                    segmentIndex = index + 1
-                    enqueueAhead()
+                readyUntil = index
+                if (!segmentPlaying && segmentIndex <= readyUntil) {
+                    playSegment()
                 }
             }
         }
@@ -189,6 +203,9 @@ internal class ReadAloudViewModel(application: Application) : AndroidViewModel(a
         endPlayback()
         tts?.shutdown()
         tts = null
+        mediaPlayer?.release()
+        mediaPlayer = null
+        wakeLock.release()
         mediaSession?.release()
         mediaSession = null
     }
@@ -261,27 +278,79 @@ internal class ReadAloudViewModel(application: Application) : AndroidViewModel(a
         }
         generation += 1
         segmentIndex = index
-        queuedUntil = index - 1
+        synthesizedUntil = index - 1
+        readyUntil = index - 1
         applyLanguage(engine, book?.language)
         updateState(state?.copy(segment = segments[index], playing = true))
         engine.stop()
-        enqueueAhead()
+        synthesizeAhead()
     }
 
-    private fun enqueueAhead() {
+    private fun synthesizeAhead() {
         val engine = tts ?: return
-        while (queuedUntil < segments.lastIndex && queuedUntil < segmentIndex + QueueAhead) {
-            queuedUntil += 1
-            val result = engine.speak(
-                segments[queuedUntil].text,
-                TextToSpeech.QUEUE_ADD,
+        audioDir.mkdirs()
+        while (synthesizedUntil < segments.lastIndex && synthesizedUntil < segmentIndex + SynthesizeAhead) {
+            synthesizedUntil += 1
+            val result = engine.synthesizeToFile(
+                segments[synthesizedUntil].text,
                 null,
-                "$generation:$queuedUntil",
+                audioFile(synthesizedUntil),
+                "$generation:$synthesizedUntil",
             )
             if (result != TextToSpeech.SUCCESS) {
                 fail(R.string.read_aloud_unavailable)
                 return
             }
+        }
+    }
+
+    private fun audioFile(index: Int) = File(audioDir, "$generation-$index.wav")
+
+    /** Plays [segmentIndex], whose audio file is ready. */
+    private fun playSegment() {
+        val file = audioFile(segmentIndex)
+        if (file.length() <= WavHeaderLength) {
+            // Nothing to say, e.g. a "* * *" separator.
+            file.delete()
+            onSegmentPlayed()
+            return
+        }
+        val player = mediaPlayer ?: MediaPlayer().apply {
+            setAudioAttributes(speechAttributes)
+            setOnCompletionListener { onSegmentPlayed() }
+            setOnErrorListener { _, _, _ ->
+                fail(R.string.read_aloud_failed)
+                true
+            }
+        }.also { mediaPlayer = it }
+        try {
+            player.reset()
+            FileInputStream(file).use { player.setDataSource(it.fd) }
+            player.prepare()
+            player.start()
+        } catch (_: Exception) {
+            fail(R.string.read_aloud_failed)
+            return
+        } finally {
+            // The player keeps its own descriptor, so the file isn't needed any more.
+            file.delete()
+        }
+        segmentPlaying = true
+        updateState(state?.copy(segment = segments[segmentIndex]))
+        synthesizeAhead()
+    }
+
+    private fun onSegmentPlayed() {
+        segmentPlaying = false
+        if (segmentIndex == segments.lastIndex) {
+            onChapterFinished()
+            return
+        }
+        segmentIndex += 1
+        if (segmentIndex <= readyUntil) {
+            playSegment()
+        } else {
+            synthesizeAhead()
         }
     }
 
@@ -295,8 +364,7 @@ internal class ReadAloudViewModel(application: Application) : AndroidViewModel(a
             return
         }
         ttsReady = true
-        engine.setOnUtteranceProgressListener(progressListener)
-        engine.setAudioAttributes(speechAttributes)
+        engine.setOnUtteranceProgressListener(synthesisListener)
         pendingSpeech?.also { pendingSpeech = null }?.invoke()
     }
 
@@ -312,7 +380,7 @@ internal class ReadAloudViewModel(application: Application) : AndroidViewModel(a
         }
     }
 
-    /** Stops the current utterances and invalidates their pending callbacks. */
+    /** Stops synthesis and playback and invalidates their pending callbacks. */
     private fun haltSpeech() {
         generation += 1
         pendingSpeech = null
@@ -321,6 +389,9 @@ internal class ReadAloudViewModel(application: Application) : AndroidViewModel(a
         if (ttsReady) {
             tts?.stop()
         }
+        mediaPlayer?.reset()
+        segmentPlaying = false
+        audioDir.listFiles()?.forEach { it.delete() }
     }
 
     private fun fail(messageRes: Int) {
@@ -393,8 +464,15 @@ internal class ReadAloudViewModel(application: Application) : AndroidViewModel(a
         }
     }
 
+    // Held exactly while reading; it's released as soon as reading stops, hence no timeout.
+    @SuppressLint("WakelockTimeout")
     private fun updateState(newState: ReadAloudState?) {
         state = newState
+        if (newState?.playing == true) {
+            wakeLock.acquire()
+        } else {
+            wakeLock.release()
+        }
         val session = mediaSession ?: return
         if (newState == null) {
             session.isActive = false

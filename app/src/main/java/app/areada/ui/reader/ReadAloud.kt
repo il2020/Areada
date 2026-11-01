@@ -27,7 +27,8 @@ internal data class ReadAloudSegment(
     val fraction: Float,
 )
 
-private const val PreferredSegmentLength = 500
+// Each segment is synthesized in full before it plays, so short ones keep the wait before speech low.
+private const val PreferredSegmentLength = 200
 private const val MaxSegmentLength = 3_500
 private const val ProbeLength = 40
 

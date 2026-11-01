@@ -48,7 +48,7 @@ class ReadAloudSegmentsTest {
         val segments = plainTextReadAloudSegments(text)
 
         assertTrue(segments.size > 1)
-        assertTrue(segments.all { it.text.length <= 500 && it.text.endsWith(".") })
+        assertTrue(segments.all { it.text.length <= 200 && it.text.endsWith(".") })
         assertEquals(text.trim(), segments.joinToString(" ") { it.text })
     }
 
