@@ -255,6 +255,7 @@ internal class ReadAloudViewModel(application: Application) : AndroidViewModel(a
     ) {
         // Without focus (e.g. during a call) nothing changes, so the paused position survives.
         if (!beginPlayback(book.title)) return
+        updateMetadata(book, chapterIndex)
         haltSpeech()
         this.book = book
         this.chapterIndex = chapterIndex
@@ -490,13 +491,22 @@ internal class ReadAloudViewModel(application: Application) : AndroidViewModel(a
             )
             noisyReceiverRegistered = true
         }
-        session.setMetadata(
-            MediaMetadata.Builder()
-                .putString(MediaMetadata.METADATA_KEY_TITLE, title)
-                .build(),
-        )
         session.isActive = true
         return true
+    }
+
+    /**
+     * Book and chapter for the media notification. The artist is its second line: the chapter
+     * title, or the app name when there's none, since some devices print a missing artist as "null".
+     */
+    private fun updateMetadata(book: ReadAloudBook, chapterIndex: Int) {
+        val chapterTitle = book.chapterTitle(chapterIndex)?.takeIf { it.isNotBlank() && it != book.title }
+        mediaSession?.setMetadata(
+            MediaMetadata.Builder()
+                .putString(MediaMetadata.METADATA_KEY_TITLE, book.title)
+                .putString(MediaMetadata.METADATA_KEY_ARTIST, chapterTitle ?: context.getString(R.string.app_name))
+                .build(),
+        )
     }
 
     /** Reading is over: gives audio focus back and stops the foreground service. */

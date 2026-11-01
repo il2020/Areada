@@ -333,6 +333,7 @@ internal fun EpubReaderScreen(
             title = screen.document.title,
             language = screen.book.language,
             chapterCount = screen.book.chapters.size,
+            chapterTitle = { index -> screen.book.chapters[index].title },
         ) { index ->
             val html = shownHtml?.takeIf { index == shownIndex }
                 ?: EpubEngine.render(screen.book, index, preferences).html

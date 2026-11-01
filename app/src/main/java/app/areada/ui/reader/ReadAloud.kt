@@ -134,6 +134,8 @@ internal class ReadAloudBook(
     val title: String,
     val language: String?,
     val chapterCount: Int,
+    /** Shown under the title in the media notification; null when the format has no chapter titles. */
+    val chapterTitle: (chapterIndex: Int) -> String? = { null },
     val loadChapter: suspend (chapterIndex: Int) -> List<ReadAloudSegment>,
 )
 
