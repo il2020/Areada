@@ -140,6 +140,7 @@
     <string name="pause_read_aloud">ठूलो स्वरमा पढ्न रोक्नुहोस्</string>
     <string name="read_aloud_unavailable">यो उपकरणमा पाठ-देखि-वाणी उपलब्ध छैन</string>
     <string name="read_aloud_failed">यो अंश पढेर सुनाउन सकिएन</string>
+    <string name="read_aloud_channel">ठूलो स्वरमा पढाइ</string>
     <string name="dismiss">हटाउनुहोस्</string>
     <string name="loading">लोड हुँदैछ</string>
     <string name="folder">फोल्डर</string>

@@ -121,6 +121,7 @@
     <string name="pause_read_aloud">Приостановить чтение вслух</string>
     <string name="read_aloud_unavailable">Синтез речи недоступен на этом устройстве</string>
     <string name="read_aloud_failed">Не удалось озвучить этот фрагмент</string>
+    <string name="read_aloud_channel">Чтение вслух</string>
     <string name="undo">Отменить</string>
     <string name="redo">Повторить</string>
     <string name="insert_timestamp">Вставить отметку времени</string>

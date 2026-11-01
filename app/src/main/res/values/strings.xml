@@ -122,6 +122,7 @@
     <string name="pause_read_aloud">Pause reading aloud</string>
     <string name="read_aloud_unavailable">Text-to-speech is unavailable on this device</string>
     <string name="read_aloud_failed">Text-to-speech failed to read this passage</string>
+    <string name="read_aloud_channel">Read aloud playback</string>
     <string name="undo">Undo</string>
     <string name="redo">Redo</string>
     <string name="insert_timestamp">Insert timestamp</string>

@@ -122,6 +122,7 @@
     <string name="pause_read_aloud">Pausar leitura em voz alta</string>
     <string name="read_aloud_unavailable">A conversão de texto em fala não está disponível neste dispositivo</string>
     <string name="read_aloud_failed">Não foi possível ler este trecho em voz alta</string>
+    <string name="read_aloud_channel">Leitura em voz alta</string>
     <string name="undo">Desfazer</string>
     <string name="redo">Refazer</string>
     <string name="insert_timestamp">Inserir data e hora</string>

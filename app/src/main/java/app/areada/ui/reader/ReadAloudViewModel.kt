@@ -76,8 +76,10 @@ internal class ReadAloudViewModel(application: Application) : AndroidViewModel(a
         .apply { setReferenceCounted(false) }
     private var mediaSession: MediaSession? = null
     private var focusRequest: AudioFocusRequest? = null
+    private var hasFocus = false
     private var resumeOnFocusGain = false
     private var noisyReceiverRegistered = false
+    private var serviceRunning = false
 
     private var book: ReadAloudBook? = null
     private var chapterIndex = 0
@@ -88,7 +90,10 @@ internal class ReadAloudViewModel(application: Application) : AndroidViewModel(a
     /** Last segment handed to the engine for synthesis, and the last one whose audio file is ready. */
     private var synthesizedUntil = -1
     private var readyUntil = -1
-    /** Whether [segmentIndex] is playing; otherwise its audio is still being synthesized. */
+    /**
+     * Whether the audio of [segmentIndex] is in the player, playing or paused mid-way; otherwise
+     * it's still being synthesized.
+     */
     private var segmentPlaying = false
     private var finished = false
     private var generation = 0
@@ -114,18 +119,25 @@ internal class ReadAloudViewModel(application: Application) : AndroidViewModel(a
 
     private val focusListener = AudioManager.OnAudioFocusChangeListener { change ->
         when (change) {
-            AudioManager.AUDIOFOCUS_GAIN -> if (resumeOnFocusGain) {
-                resumeOnFocusGain = false
-                resume()
+            AudioManager.AUDIOFOCUS_GAIN -> {
+                hasFocus = true
+                if (resumeOnFocusGain) {
+                    resumeOnFocusGain = false
+                    resume()
+                }
             }
+            // A notification sound, navigation prompt or call: pause mid-phrase and go on afterwards.
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
-            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> if (state?.playing == true) {
-                pause(abandonFocus = false)
-                resumeOnFocusGain = true
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                hasFocus = false
+                if (state?.playing == true) {
+                    pausePlayback()
+                    resumeOnFocusGain = true
+                }
             }
             AudioManager.AUDIOFOCUS_LOSS -> {
-                resumeOnFocusGain = false
                 pause()
+                abandonFocus()
             }
         }
     }
@@ -161,17 +173,23 @@ internal class ReadAloudViewModel(application: Application) : AndroidViewModel(a
     fun resume() {
         val currentBook = book ?: return
         if (state?.playing != false || finished) return
-        if (segmentIndex in segments.indices) {
-            if (beginPlayback(currentBook.title)) {
+        when {
+            segmentPlaying -> if (beginPlayback(currentBook.title)) {
+                mediaPlayer?.start()
+                updateState(state?.copy(playing = true))
+            }
+            segmentIndex in segments.indices -> if (beginPlayback(currentBook.title)) {
                 speakFrom(segmentIndex)
             }
-        } else {
             // Paused while the chapter was loading: start where the reader originally asked to.
-            startChapter(currentBook, chapterIndex, pickStart)
+            else -> startChapter(currentBook, chapterIndex, pickStart)
         }
     }
 
-    fun pause() = pause(abandonFocus = true)
+    fun pause() {
+        resumeOnFocusGain = false
+        pausePlayback()
+    }
 
     /** Restarts reading at the start of [chapterIndex] if the user navigated there while reading. */
     fun followChapter(documentUri: String, chapterIndex: Int) {
@@ -210,11 +228,22 @@ internal class ReadAloudViewModel(application: Application) : AndroidViewModel(a
         mediaSession = null
     }
 
-    private fun pause(abandonFocus: Boolean) {
+    /** Ends reading but keeps its position, e.g. on Stop from a watch or the assistant. */
+    private fun stopPlayback() {
+        pause()
+        endPlayback()
+    }
+
+    /**
+     * Stops speaking but keeps focus and the service, so reading can resume in the background.
+     * Audio already playing is paused mid-way and continues from there.
+     */
+    private fun pausePlayback() {
         if (state?.playing != true) return
-        haltSpeech()
-        if (abandonFocus) {
-            endPlayback()
+        if (segmentPlaying) {
+            mediaPlayer?.pause()
+        } else {
+            haltSpeech()
         }
         updateState(state?.copy(playing = false))
     }
@@ -394,38 +423,40 @@ internal class ReadAloudViewModel(application: Application) : AndroidViewModel(a
         audioDir.listFiles()?.forEach { it.delete() }
     }
 
+    /** Pauses on an error; Play retries from the failed segment. */
     private fun fail(messageRes: Int) {
         haltSpeech()
-        endPlayback()
         updateState(state?.copy(playing = false))
         Toast.makeText(context, messageRes, Toast.LENGTH_SHORT).show()
     }
 
-    /** Takes audio focus and the media session; false when the system refuses focus (e.g. during a call). */
+    /**
+     * Takes audio focus (unless it's still held), the media session and the foreground service;
+     * false when the system refuses focus (e.g. during a call) or the service (app in the
+     * background). Both are kept while paused: on Android 15+ focus is only granted to the top
+     * app or one running a foreground service.
+     */
     private fun beginPlayback(title: String): Boolean {
-        val focusResult = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val request = focusRequest ?: AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-                .setAudioAttributes(speechAttributes)
-                .setWillPauseWhenDucked(true)
-                .setOnAudioFocusChangeListener(focusListener)
-                .build()
-                .also { focusRequest = it }
-            audioManager.requestAudioFocus(request)
-        } else {
-            @Suppress("DEPRECATION")
-            audioManager.requestAudioFocus(focusListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN)
-        }
-        if (focusResult != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
-            return false
-        }
-        if (!noisyReceiverRegistered) {
-            ContextCompat.registerReceiver(
-                context,
-                noisyReceiver,
-                IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY),
-                ContextCompat.RECEIVER_NOT_EXPORTED,
-            )
-            noisyReceiverRegistered = true
+        if (!hasFocus) {
+            val focusResult = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val request = focusRequest ?: AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                    .setAudioAttributes(speechAttributes)
+                    // Speech under another sound gets lost, so the listener pauses instead of ducking.
+                    .setWillPauseWhenDucked(true)
+                    .setOnAudioFocusChangeListener(focusListener)
+                    .build()
+                    .also { focusRequest = it }
+                audioManager.requestAudioFocus(request)
+            } else {
+                @Suppress("DEPRECATION")
+                audioManager.requestAudioFocus(focusListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN)
+            }
+            if (focusResult != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+                return false
+            }
+            hasFocus = true
+            // Granted directly, so the GAIN of an earlier transient loss won't come any more.
+            resumeOnFocusGain = false
         }
         val session = mediaSession ?: MediaSession(context, "AreadaReadAloud").apply {
             @Suppress("DEPRECATION")
@@ -436,10 +467,29 @@ internal class ReadAloudViewModel(application: Application) : AndroidViewModel(a
 
                     override fun onPause() = pause()
 
-                    override fun onStop() = pause()
+                    override fun onStop() = stopPlayback()
                 },
             )
         }.also { mediaSession = it }
+        if (!serviceRunning) {
+            try {
+                ReadAloudService.start(context, title, session.sessionToken)
+            } catch (_: IllegalStateException) {
+                // Android 12+ refuses a foreground service to an app in the background.
+                abandonFocus()
+                return false
+            }
+            serviceRunning = true
+        }
+        if (!noisyReceiverRegistered) {
+            ContextCompat.registerReceiver(
+                context,
+                noisyReceiver,
+                IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY),
+                ContextCompat.RECEIVER_NOT_EXPORTED,
+            )
+            noisyReceiverRegistered = true
+        }
         session.setMetadata(
             MediaMetadata.Builder()
                 .putString(MediaMetadata.METADATA_KEY_TITLE, title)
@@ -449,18 +499,27 @@ internal class ReadAloudViewModel(application: Application) : AndroidViewModel(a
         return true
     }
 
-    /** Gives audio focus back; the media session stays active so a headset can resume reading. */
+    /** Reading is over: gives audio focus back and stops the foreground service. */
     private fun endPlayback() {
+        abandonFocus()
+        if (noisyReceiverRegistered) {
+            context.unregisterReceiver(noisyReceiver)
+            noisyReceiverRegistered = false
+        }
+        if (serviceRunning) {
+            ReadAloudService.stop(context)
+            serviceRunning = false
+        }
+    }
+
+    private fun abandonFocus() {
+        hasFocus = false
         resumeOnFocusGain = false
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             focusRequest?.let(audioManager::abandonAudioFocusRequest)
         } else {
             @Suppress("DEPRECATION")
             audioManager.abandonAudioFocus(focusListener)
-        }
-        if (noisyReceiverRegistered) {
-            context.unregisterReceiver(noisyReceiver)
-            noisyReceiverRegistered = false
         }
     }
 
